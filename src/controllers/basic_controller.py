@@ -24,21 +24,16 @@ class BasicMAC:
         return chosen_actions
 
     def forward(self, ep_batch, t, bs=slice(None), test_mode=False):
-        # Slice the batch and hidden states to avoid running the RNNs on stale data from terminated envs
-        agent_inputs = self._build_inputs(ep_batch, t, bs=bs)
-        avail_actions = ep_batch["avail_actions"][bs, t]
+        # Slice batch and hidden states to only run on active (non-terminated) envs
+        ep_batch = ep_batch[bs]
+        agent_inputs = self._build_inputs(ep_batch, t)
+        avail_actions = ep_batch["avail_actions"][:, t]
 
-        is_subset = not isinstance(bs, slice)
-        hidden_in = self.hidden_states[bs] if is_subset else self.hidden_states
-        agent_outs, hidden_out = self.agent(agent_inputs, hidden_in)
-
-        if is_subset:
-            self.hidden_states[bs] = hidden_out.view_as(self.hidden_states[bs])
-        else:
-            self.hidden_states = hidden_out.view_as(self.hidden_states)
+        agent_outs, hidden_out = self.agent(agent_inputs, self.hidden_states[bs])
+        self.hidden_states[bs] = hidden_out.view_as(self.hidden_states[bs])
 
         # Softmax the agent outputs if they're policy logits
-        n_live = avail_actions.shape[0]
+        n_live = ep_batch.batch_size
         if self.agent_output_type == "pi_logits":
             if getattr(self.args, "mask_before_softmax", True):
                 # Make the logits for unavailable actions very negative to minimise their effect on the softmax
@@ -70,23 +65,21 @@ class BasicMAC:
     def _build_agents(self, input_shape):
         self.agent = agent_REGISTRY[self.args.agent](input_shape, self.args)
 
-    def _build_inputs(self, batch, t, bs=slice(None)):
+    def _build_inputs(self, batch, t):
         # Assumes homogenous agents with flat observations.
         # Other MACs might want to e.g. delegate building inputs to each agent
-        bs_data = batch[bs]
-        bs_size = bs_data.batch_size
-
+        bs = batch.batch_size
         inputs = []
-        inputs.append(bs_data["obs"][:, t])  # b1av
+        inputs.append(batch["obs"][:, t])  # b1av
         if self.args.obs_last_action:
             if t == 0:
-                inputs.append(th.zeros_like(bs_data["actions_onehot"][:, t]))
+                inputs.append(th.zeros_like(batch["actions_onehot"][:, t]))
             else:
-                inputs.append(bs_data["actions_onehot"][:, t-1])
+                inputs.append(batch["actions_onehot"][:, t-1])
         if self.args.obs_agent_id:
-            inputs.append(th.eye(self.n_agents, device=batch.device).unsqueeze(0).expand(bs_size, -1, -1))
+            inputs.append(th.eye(self.n_agents, device=batch.device).unsqueeze(0).expand(bs, -1, -1))
 
-        inputs = th.cat([x.reshape(bs_size * self.n_agents, -1) for x in inputs], dim=1)
+        inputs = th.cat([x.reshape(bs * self.n_agents, -1) for x in inputs], dim=1)
         return inputs
 
     def _get_input_shape(self, scheme):
